@@ -18,6 +18,11 @@ const API: &str = "https://api.scryfall.com";
 const UA: &str = "scry-cli/0.1.0 (+https://github.com/mathdroid/scry)";
 // Scryfall asks for 50-100ms between requests.
 const DELAY: Duration = Duration::from_millis(100);
+// When Scryfall rate-limits us (HTTP 429) or is briefly unavailable (503),
+// back off and retry instead of failing. This lets several scry processes run
+// at once (e.g. a script calling scry in a loop) without coordination: each
+// one waits out the limit on its own.
+const MAX_RETRIES: u32 = 8;
 
 #[derive(Parser)]
 #[command(
@@ -127,11 +132,50 @@ fn explain(err: ureq::Error) -> String {
     }
 }
 
+// Seconds to wait before retry `attempt` (0-based) when there's no Retry-After
+// header: 2, 4, 8, 16, 32, then capped at 60.
+fn backoff_secs(attempt: u32) -> u64 {
+    2u64.saturating_pow(attempt + 1).min(60)
+}
+
+// Run a ureq request, retrying on 429/503 with backoff (honoring Retry-After
+// when present). The closure rebuilds the request each attempt because ureq
+// consumes a request when it is sent.
+fn with_retry<F>(mut send: F) -> Result<ureq::Response, ureq::Error>
+where
+    F: FnMut() -> Result<ureq::Response, ureq::Error>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match send() {
+            Err(ureq::Error::Status(code, resp))
+                if (code == 429 || code == 503) && attempt < MAX_RETRIES =>
+            {
+                let wait = resp
+                    .header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or_else(|| backoff_secs(attempt))
+                    .max(1);
+                eprintln!(
+                    "scry: HTTP {code} (rate limited); waiting {wait}s, retry {}/{}",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                sleep(Duration::from_secs(wait));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 fn get_page(url: &str) -> Result<SearchPage, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", UA)
-        .set("Accept", "application/json")
-        .call();
+    let resp = with_retry(|| {
+        ureq::get(url)
+            .set("User-Agent", UA)
+            .set("Accept", "application/json")
+            .call()
+    });
     match resp {
         Ok(r) => r.into_json::<SearchPage>().map_err(|e| e.to_string()),
         // A search with zero results is a 404 from Scryfall; treat it as empty.
@@ -177,6 +221,12 @@ fn run_search(query: &str, count_only: bool, long: bool, as_json: bool) -> Resul
         return Ok(());
     }
 
+    // --count always prints just the total, so it works in pipes and scripts.
+    if count_only {
+        println!("{total}");
+        return Ok(());
+    }
+
     // When piped (stdout not a terminal), emit only bare card names so the
     // output drops straight into `scry oracle`. The count header is for humans.
     let piped = !is_stdout_tty();
@@ -184,7 +234,7 @@ fn run_search(query: &str, count_only: bool, long: bool, as_json: bool) -> Resul
         let noun = if total == 1 { "card" } else { "cards" };
         println!("{total} {noun} matching `{query}`");
     }
-    if count_only || total == 0 {
+    if total == 0 {
         return Ok(());
     }
     if !piped {
@@ -242,12 +292,14 @@ fn run_oracle(names: Vec<String>, deck: Option<String>, as_json: bool) -> Result
             .map(|n| json!({ "name": front_face(n) }))
             .collect();
         let body = json!({ "identifiers": identifiers });
-        let resp = ureq::post(&format!("{API}/cards/collection"))
-            .set("User-Agent", UA)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(explain)?;
+        let resp = with_retry(|| {
+            ureq::post(&format!("{API}/cards/collection"))
+                .set("User-Agent", UA)
+                .set("Accept", "application/json")
+                .set("Content-Type", "application/json")
+                .send_json(body.clone())
+        })
+        .map_err(explain)?;
         let coll: Collection = resp.into_json().map_err(|e| e.to_string())?;
         cards.extend(coll.data);
         for nf in coll.not_found {
