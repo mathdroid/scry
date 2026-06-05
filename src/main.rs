@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 const API: &str = "https://api.scryfall.com";
-const UA: &str = "scry/0.1 (Scryfall CLI; +https://scryfall.com/docs/api)";
+const UA: &str = "scry-cli/0.1.0 (+https://github.com/mathdroid/scry)";
 // Scryfall asks for 50-100ms between requests.
 const DELAY: Duration = Duration::from_millis(100);
 
