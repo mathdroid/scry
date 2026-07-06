@@ -64,6 +64,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show official rulings for one or more cards.
+    Rulings {
+        /// Card names. Each argument is one full card name.
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// Print the raw Scryfall rulings JSON per card.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---- Scryfall response types ----
@@ -111,6 +120,7 @@ fn main() {
             json,
         } => run_search(&query.join(" "), count, long, json),
         Cmd::Oracle { names, deck, json } => run_oracle(names, deck, json),
+        Cmd::Rulings { names, json } => run_rulings(names, json),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -279,6 +289,32 @@ fn run_oracle(names: Vec<String>, deck: Option<String>, as_json: bool) -> Result
         return Err("no card names given (pass names, --deck FILE, or pipe a decklist)".into());
     }
 
+    let (cards, not_found) = resolve_cards(&wanted)?;
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&cards).unwrap());
+    } else {
+        for (i, c) in cards.iter().enumerate() {
+            if i > 0 {
+                println!();
+                println!("{}", "-".repeat(40));
+                println!();
+            }
+            print_card(c);
+        }
+    }
+
+    if !not_found.is_empty() {
+        eprintln!("\nnot found: {}", not_found.join(", "));
+    }
+    Ok(())
+}
+
+/// Resolve card names to full Scryfall card objects via the collection
+/// endpoint. Returns the cards plus the names Scryfall did not recognize.
+fn resolve_cards(
+    wanted: &[String],
+) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
     let mut cards: Vec<serde_json::Value> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
 
@@ -309,20 +345,53 @@ fn run_oracle(names: Vec<String>, deck: Option<String>, as_json: bool) -> Result
         }
         sleep(DELAY);
     }
+    Ok((cards, not_found))
+}
 
-    if as_json {
-        println!("{}", serde_json::to_string_pretty(&cards).unwrap());
-    } else {
-        for (i, c) in cards.iter().enumerate() {
+// ---- rulings ----
+
+fn run_rulings(names: Vec<String>, as_json: bool) -> Result<(), String> {
+    let wanted = dedup_ci(names);
+    let (cards, not_found) = resolve_cards(&wanted)?;
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for (i, c) in cards.iter().enumerate() {
+        let name = field(c, "name").unwrap_or("?");
+        let uri = field(c, "rulings_uri")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{API}/cards/{}/rulings", field(c, "id").unwrap_or("")));
+        let resp = with_retry(|| {
+            ureq::get(&uri)
+                .set("User-Agent", UA)
+                .set("Accept", "application/json")
+                .call()
+        })
+        .map_err(explain)?;
+        let page: SearchPage = resp.into_json().map_err(|e| e.to_string())?;
+
+        if as_json {
+            out.push(json!({ "name": name, "rulings": page.data }));
+        } else {
             if i > 0 {
                 println!();
-                println!("{}", "-".repeat(40));
-                println!();
             }
-            print_card(c);
+            if page.data.is_empty() {
+                println!("{name}: no rulings");
+            } else {
+                println!("{name}:");
+                for r in &page.data {
+                    let date = field(r, "published_at").unwrap_or("?");
+                    let text = field(r, "comment").unwrap_or("");
+                    println!("  [{date}] {text}");
+                }
+            }
         }
+        sleep(DELAY);
     }
 
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    }
     if !not_found.is_empty() {
         eprintln!("\nnot found: {}", not_found.join(", "));
     }

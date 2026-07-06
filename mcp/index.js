@@ -121,5 +121,95 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "scryfall_rulings",
+  {
+    title: "Scryfall rulings",
+    description:
+      "Return the official rulings (with dates) for one or more Magic cards.",
+    inputSchema: {
+      names: z
+        .array(z.string())
+        .nonempty()
+        .describe("Card names, each a full card name."),
+    },
+  },
+  async ({ names }) => {
+    const { code, stdout, stderr } = await runScry(["rulings", ...names]);
+    if (code !== 0) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: stderr.trim() || `scry exited ${code}` }],
+      };
+    }
+    const text = stderr.trim() ? `${stdout.trimEnd()}\n\n${stderr.trim()}` : stdout;
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.registerTool(
+  "scryfall_card_details",
+  {
+    title: "Scryfall card details",
+    description:
+      "Return card details beyond oracle text: format legalities and current " +
+      "prices (USD/EUR/tix), plus mana cost and type line. Accepts card names " +
+      "and/or a raw decklist.",
+    inputSchema: {
+      names: z
+        .array(z.string())
+        .optional()
+        .describe("Card names, each a full card name."),
+      decklist: z
+        .string()
+        .optional()
+        .describe("A decklist to resolve (quantities/headers stripped)."),
+    },
+  },
+  async ({ names, decklist }) => {
+    if ((!names || names.length === 0) && (!decklist || !decklist.trim())) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "provide `names` and/or a `decklist`." }],
+      };
+    }
+    const { code, stdout, stderr } = await runScry(
+      ["oracle", "--json", ...(names || [])],
+      decklist
+    );
+    if (code !== 0) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: stderr.trim() || `scry exited ${code}` }],
+      };
+    }
+    const cards = JSON.parse(stdout);
+    const blocks = cards.map((c) => {
+      const lines = [
+        [c.name, c.mana_cost].filter(Boolean).join("  "),
+        c.type_line,
+      ].filter(Boolean);
+      const legal = Object.entries(c.legalities || {})
+        .filter(([, v]) => v === "legal")
+        .map(([f]) => f);
+      lines.push(legal.length ? `legal in: ${legal.join(", ")}` : "legal in: (nothing)");
+      const p = c.prices || {};
+      const prices = [
+        p.usd && `$${p.usd}`,
+        p.usd_foil && `$${p.usd_foil} foil`,
+        p.eur && `${p.eur} EUR`,
+        p.tix && `${p.tix} tix`,
+      ].filter(Boolean);
+      if (prices.length) lines.push(`prices: ${prices.join(" / ")}`);
+      return lines.join("\n");
+    });
+    const text = blocks.join("\n\n" + "-".repeat(40) + "\n\n");
+    const tail = stderr.trim();
+    return {
+      content: [{ type: "text", text: tail ? `${text}\n\n${tail}` : text }],
+    };
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
